@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+ads824a-venv/
+
+# Editor / OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime output produced by ADS824A_Toolkit.py -- these are generated
+# per-run against a live instrument, not project source.
+waveform_ch*.csv
+waveform_ch*_fft.png
+wavfrm_raw_debug.txt
+screen_image.png
+
+# Runtime output from the FTP test scripts.
+ftp_incoming/
