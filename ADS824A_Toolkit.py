@@ -111,8 +111,21 @@ def _populate_scale_combo(combo: QComboBox, values: List[float], unit: str) -> N
         combo.addItem(_format_engineering(value, unit), value)
 
 
-# Vertical scale: 1 mV/div .. 10 V/div.
-VERTICAL_SCALE_VALUES = _generate_1_2_5_values(1e-3, 10.0)
+# Vertical scale (BASE, i.e. at probe ratio 1x): the instrument's real
+# hardware range is 500 uV/div .. 10 V/div. Probe ratio and Scale are
+# two independent settings:
+#   - Probe ratio (:CHx:PRObe:GAIN) only affects what the instrument
+#     displays -- it multiplies the on-screen V/div by the ratio, with
+#     no effect on the real analog front end. This works correctly on
+#     this instrument; there is nothing to compensate for here.
+#   - Scale (:CHx:SCALe) sets the real gain at the input. This is where
+#     the one confirmed firmware bug lives (see
+#     _SCALE_FIRMWARE_QUIRK_FACTOR below).
+# The GUI's Scale combo shows this base list multiplied by whatever
+# probe ratio is currently selected (effective = level * ratio, purely
+# a label -- see ChannelPanel._populate_scale_combo_for_ratio), the
+# same way the instrument's own on-screen display works.
+BASE_VERTICAL_SCALE_VALUES = _generate_1_2_5_values(5e-4, 10.0)
 
 # Horizontal (timebase) scale: 1 ns/div .. 100 s/div. This is a generous
 # superset -- the ADS824A's real minimum/maximum scale depends on its
@@ -121,8 +134,18 @@ VERTICAL_SCALE_VALUES = _generate_1_2_5_values(1e-3, 10.0)
 HORIZONTAL_SCALE_VALUES = _generate_1_2_5_values(1e-9, 100.0)
 
 # Probe attenuation ratio: 0.001x .. 1000x (covers both standard voltage
-# probes such as 1x/10x/100x and low-ratio current probes).
+# probes such as 1x/10x/100x and low-ratio current probes). Confirmed
+# correct as-is -- no compensation needed for this one.
 PROBE_RATIO_VALUES = _generate_1_2_5_values(1e-3, 1000.0)
+
+# The one confirmed firmware bug on this instrument: :CHx:SCALe's raw
+# value is silently divided by 10 by the instrument's own firmware
+# before being applied to the real analog front end (confirmed by
+# sending raw SCALe=100 and getting a real 10 V/div result). To make
+# the real gain equal some intended value, send 10x that value. This
+# is unconditional and independent of probe ratio -- ratio changes
+# never need a fresh Scale write (see _on_probe_gain_changed).
+_SCALE_FIRMWARE_QUIRK_FACTOR = 10.0
 
 
 def _load_waveform_csv(csv_path: Path) -> List[Tuple[str, List[float], List[float]]]:
@@ -346,6 +369,19 @@ class ScpiInstrumentController:
             self.instrument.read_termination = "\n"
             self.instrument.write_termination = "\n"
 
+        self._initialize_channels()
+
+    def _initialize_channels(self) -> None:
+        """Put every channel into a known state (ratio=1x, 1 V/div) right
+        after connecting, through the same public methods the GUI uses --
+        so the always-on Scale compensation (_SCALE_FIRMWARE_QUIRK_FACTOR)
+        is applied here too, and the instrument actually starts out at a
+        real 1 V/div matching the GUI's own default controls."""
+
+        for channel in (1, 2, 3, 4):
+            self.set_channel_probe_gain(channel, 1.0)
+            self.set_channel_scale(channel, 1.0)
+
     def _require_instrument(self):
         """Return the active instrument or raise a clear error for the GUI."""
 
@@ -424,9 +460,15 @@ class ScpiInstrumentController:
         return f"CH{channel} display {'enabled' if enabled else 'disabled'}."
 
     def set_channel_scale(self, channel: int, volts_per_div: float) -> str:
-        """Set a channel's vertical scale in volts/division."""
+        """Set a channel's *raw* vertical scale in volts/division -- the
+        value :CHx:SCALe would mean at probe ratio 1x, before the
+        ChannelPanel's ratio-multiplied combo box divides back down to
+        this. Internally compensates for the firmware quirk described
+        above _SCALE_FIRMWARE_QUIRK_FACTOR, so callers never need to
+        think about it."""
 
-        self._write(f":CH{channel}:SCALe {volts_per_div}")
+        raw_value = volts_per_div * _SCALE_FIRMWARE_QUIRK_FACTOR
+        self._write(f":CH{channel}:SCALe {raw_value}")
         return f"CH{channel} scale set near {volts_per_div} V/div."
 
     def set_channel_position(self, channel: int, divisions: float) -> str:
@@ -1197,16 +1239,15 @@ class ChannelPanel(QWidget):
         self.controls.append(self.enabled_checkbox)
 
         # Scale/probe ratio use combo boxes of the real 1-2-5 "friendly
-        # step" values the instrument snaps to (see VERTICAL_SCALE_VALUES
-        # / PROBE_RATIO_VALUES), instead of a free-text field -- this
+        # step" values the instrument snaps to (see BASE_VERTICAL_SCALE_
+        # VALUES / PROBE_RATIO_VALUES), instead of a free-text field -- this
         # avoids entering a value the instrument would silently round to
         # something else. Selecting an item applies immediately (mouse
         # wheel or click both work on a focused combo box), with no
         # separate Set button, the same way the coupling/bandwidth combos
         # already behave.
         self.scale_combo = QComboBox()
-        _populate_scale_combo(self.scale_combo, VERTICAL_SCALE_VALUES, "V")
-        self.scale_combo.setCurrentText(_format_engineering(1.0, "V"))
+        self._populate_scale_combo_for_ratio(1.0)
         self.scale_combo.currentIndexChanged.connect(self._on_scale_changed)
         form.addRow("Scale (V/div):", self.scale_combo)
         self.controls.append(self.scale_combo)
@@ -1324,11 +1365,34 @@ class ChannelPanel(QWidget):
             lambda: self.controller.set_channel_enabled(self.channel, enabled),
         )
 
+    def _populate_scale_combo_for_ratio(self, ratio: float) -> None:
+        """(Re)fill the Scale combo's *labels* for a new probe ratio --
+        effective label = base level * ratio, purely cosmetic, matching
+        exactly how the instrument's own on-screen display reacts to a
+        ratio change (confirmed correct, no bug there). The same *level*
+        (list index into BASE_VERTICAL_SCALE_VALUES) stays selected
+        across the change, because the real analog scale does not
+        change just because the ratio label did -- so nothing is sent
+        to the instrument here; see _on_probe_gain_changed."""
+
+        level_index = max(self.scale_combo.currentIndex(), 0)
+        self.scale_combo.blockSignals(True)
+        self.scale_combo.clear()
+        _populate_scale_combo(
+            self.scale_combo,
+            [level * ratio for level in BASE_VERTICAL_SCALE_VALUES],
+            "V",
+        )
+        self.scale_combo.setCurrentIndex(min(level_index, self.scale_combo.count() - 1))
+        self.scale_combo.blockSignals(False)
+
     def _on_scale_changed(self) -> None:
-        value = self.scale_combo.currentData()
+        effective_value = self.scale_combo.currentData()
+        ratio = self.probe_combo.currentData()
+        raw_value = effective_value / ratio
         self.run_action(
             f"CH{self.channel} scale",
-            lambda: self.controller.set_channel_scale(self.channel, value),
+            lambda: self.controller.set_channel_scale(self.channel, raw_value),
         )
 
     def _on_position_changed(self, value: float) -> None:
@@ -1358,10 +1422,15 @@ class ChannelPanel(QWidget):
         )
 
     def _on_probe_gain_changed(self) -> None:
-        value = self.probe_combo.currentData()
+        ratio = self.probe_combo.currentData()
+        # Ratio only changes the label (the instrument's own display
+        # updates itself immediately and correctly -- confirmed, no bug
+        # there). Only relabel the combo here; nothing is sent for
+        # Scale, since the real analog scale is unaffected by ratio.
+        self._populate_scale_combo_for_ratio(ratio)
         self.run_action(
             f"CH{self.channel} probe ratio",
-            lambda: self.controller.set_channel_probe_gain(self.channel, value),
+            lambda: self.controller.set_channel_probe_gain(self.channel, ratio),
         )
 
     def _on_save_waveform(self) -> None:
