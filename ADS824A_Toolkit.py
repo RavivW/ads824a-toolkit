@@ -31,12 +31,40 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-# Default LAN resource address for this scope. Discovered via the scope's
-# built-in web page (Network Configuration / SCPI tab): LAN IP 192.168.10.108,
-# SCPI Socket Port 3000. PyVISA needs explicit '\n' terminators for the raw
-# SOCKET resource type because, unlike VXI-11 (::inst0::INSTR), a plain TCP
-# socket has no built-in message framing.
-DEFAULT_LAN_RESOURCE = "TCPIP0::192.168.10.108::3000::SOCKET"
+# Default LAN resource address for this scope, used to pre-fill the manual
+# address field. SCPI Socket Port 3000. PyVISA needs explicit '\n'
+# terminators for the raw SOCKET resource type because, unlike VXI-11
+# (::inst0::INSTR), a plain TCP socket has no built-in message framing.
+#
+# The IP itself comes from DHCP and can change (it moved from .108 to
+# .104 on 2026-09-20) -- this constant is only a fallback starting point
+# for the manual field. The scanned-list Connect button does not depend
+# on this at all: see _socket_resource_for_tcpip_instr() below, which
+# rewrites whatever IP scan_instruments() currently discovers.
+DEFAULT_LAN_RESOURCE = "TCPIP0::192.168.10.104::3000::SOCKET"
+
+# scan_instruments() discovers this scope as a VXI-11-style resource, e.g.
+# "TCPIP::192.168.10.104::INSTR" -- but per the README, VXI-11 opens
+# without error and then times out on every query; only the raw SCPI
+# socket (port 3000) actually answers on this firmware. So the address a
+# scan finds is never directly connectable -- connect_selected_instrument()
+# uses this to rewrite it into the working SOCKET form before connecting,
+# which also means an IP change (DHCP) is picked up automatically the next
+# time the instrument list is scanned, with no manual editing needed.
+_TCPIP_INSTR_PATTERN = re.compile(r"^TCPIP\d*::([^:]+)::(?:.+::)?INSTR$", re.IGNORECASE)
+
+
+def _socket_resource_for_tcpip_instr(resource_address: str) -> str:
+    """Rewrite a scanned VXI-11-style TCPIP/INSTR resource into this
+    scope's working raw-socket address (see comment above). Returns the
+    address unchanged if it doesn't match that shape (already a SOCKET
+    address, or a USB/GPIB resource)."""
+
+    match = _TCPIP_INSTR_PATTERN.match(resource_address.strip())
+    if not match:
+        return resource_address
+    host = match.group(1)
+    return f"TCPIP0::{host}::3000::SOCKET"
 
 # Standard 8-byte PNG file signature, used to sanity-check that the parsed
 # screen capture response actually looks like a PNG before saving it.
@@ -348,8 +376,15 @@ class ScpiInstrumentController:
         return list(resource_manager.list_resources())
 
     def connect(self, resource_address: str) -> None:
-        """Open the selected VISA resource and prepare it for SCPI traffic."""
+        """Open the selected VISA resource and prepare it for SCPI traffic.
 
+        Any scanned VXI-11-style TCPIP/INSTR address is rewritten to this
+        scope's actually-working raw-socket form first (see
+        _socket_resource_for_tcpip_instr) -- callers never need to do this
+        themselves, and self.instrument_address always ends up holding the
+        address that really works, for display and for reconnect()."""
+
+        resource_address = _socket_resource_for_tcpip_instr(resource_address)
         self.close_instrument()
         resource_manager = self._get_resource_manager()
         self.instrument = resource_manager.open_resource(resource_address)
@@ -1047,7 +1082,7 @@ class ScpiInstrumentController:
         """
 
         self.connect(resource_address)
-        return f"Reconnected to {resource_address}."
+        return f"Reconnected to {self.instrument_address}."
 
     def close(self) -> None:
         """Release both the instrument session and the VISA resource manager."""
@@ -1192,9 +1227,14 @@ class InstrumentSelectionWindow(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
 
+        # connect() may have rewritten resource_address (e.g. a scanned
+        # VXI-11-style TCPIP/INSTR address into the working SOCKET form) --
+        # use the address it actually ended up using, not the one we passed
+        # in, so the control window's display and its future reconnect()
+        # calls use the address that really works.
         self.control_window = InstrumentControlWindow(
             controller=self.controller,
-            resource_address=resource_address,
+            resource_address=self.controller.instrument_address,
         )
         self.control_window.show()
         self.close()
